@@ -1,5 +1,5 @@
 {
-  "name": "Remix: Alegria FAMS",
+  "name": "Alegria FAMS",
   "description": "Farmers Association Management System with Offline-First Governance for the Alegria Farmers Association of Tuburan, Cebu",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": [
