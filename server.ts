@@ -4,13 +4,116 @@ import fs from "fs";
 import bcrypt from "bcryptjs";
 import helmet from "helmet";
 import crypto from "crypto";
+import dotenv from "dotenv";
+import pg from "pg";
+
+dotenv.config();
 
 const app = express();
 app.set("trust proxy", 1);
 const PORT = 3000;
 const DB_FILE = path.join(process.cwd(), "db_fams.json");
 
+// Postgres/Aiven Database Connection Pool Config
+const dbConnectionString = process.env.AIVEN_DATABASE_URL || process.env.DATABASE_URL || process.env.POSTGRES_URL;
+const pool = dbConnectionString
+  ? new pg.Pool({
+      connectionString: dbConnectionString,
+      ssl: {
+        rejectUnauthorized: false
+      }
+    })
+  : null;
+
+if (pool) {
+  console.log("[Aiven DB] Database connection url detected and configured.");
+} else {
+  console.log("[Aiven DB] No database URL found. Defaulting to local db_fams.json.");
+}
+
+// Global caching container to prevent double loads & provide lightning fast operations
+let cachedDBInMemory: Database | null = null;
+let isDbDirty = false;
+
+// Safe load helper
+async function ensureDbLoaded() {
+  if (pool) {
+    try {
+      // Create table if not exist
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS fams_store (
+          id VARCHAR(50) PRIMARY KEY,
+          data JSON NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // Attempt reading main document
+      const res = await pool.query("SELECT data FROM fams_store WHERE id = 'main'");
+      if (res.rows.length > 0) {
+        cachedDBInMemory = res.rows[0].data as Database;
+      } else {
+        // First run: Seed from local or defaults
+        console.log("[Aiven DB] No existing database row found on cloud. Seeding from local data...");
+        const initial = readLocalJSONFile();
+        await pool.query("INSERT INTO fams_store (id, data) VALUES ('main', $1)", [JSON.stringify(initial)]);
+        cachedDBInMemory = initial;
+      }
+    } catch (err) {
+      console.error("[Aiven DB] Error fetching from Aiven database:", err);
+      if (!cachedDBInMemory) {
+        cachedDBInMemory = readLocalJSONFile();
+      }
+    }
+  } else {
+    if (!cachedDBInMemory) {
+      cachedDBInMemory = readLocalJSONFile();
+    }
+  }
+}
+
+// Safe upload/save helper
+async function persistDbToCloud() {
+  if (pool && cachedDBInMemory && isDbDirty) {
+    try {
+      await pool.query(
+        "INSERT INTO fams_store (id, data, updated_at) VALUES ('main', $1, CURRENT_TIMESTAMP) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = CURRENT_TIMESTAMP",
+        [JSON.stringify(cachedDBInMemory)]
+      );
+      isDbDirty = false;
+      console.log("[Aiven DB] Cleanly committed state to Aiven cloud DB.");
+    } catch (err) {
+      console.error("[Aiven DB] Failed to save state to Aiven cloud database:", err);
+    }
+  }
+}
+
 app.use(express.json());
+
+// Aiven State Synchronization Middleware
+app.use(async (req, res, next) => {
+  // We only run database loading & intercepting on API requests
+  if (req.path.startsWith("/api")) {
+    await ensureDbLoaded();
+
+    const originalJson = res.json;
+    res.json = (function (this: any, body: any) {
+      if (isDbDirty) {
+        persistDbToCloud().catch(err => console.error("[Aiven DB] Background save failed:", err));
+      }
+      return originalJson.call(this, body);
+    }) as any;
+
+    const originalSend = res.send;
+    res.send = (function (this: any, body: any) {
+      if (isDbDirty) {
+        persistDbToCloud().catch(err => console.error("[Aiven DB] Background save failed:", err));
+      }
+      return originalSend.call(this, body);
+    }) as any;
+  }
+  next();
+});
 
 // Set up security headers via Helmet
 app.use(helmet({
@@ -371,8 +474,17 @@ const DEFAULT_DB: Database = {
   passwordResetRequests: []
 };
 
-// Helper function to read database securely
+// Helper function to read database securely (Aiven-aware and cached)
 function readDB(): Database {
+  if (cachedDBInMemory) {
+    return cachedDBInMemory;
+  }
+  cachedDBInMemory = readLocalJSONFile();
+  return cachedDBInMemory;
+}
+
+// Internal function to read from the local file DB
+function readLocalJSONFile(): Database {
   try {
     if (!fs.existsSync(DB_FILE)) {
       const initDB = { ...DEFAULT_DB };
@@ -807,8 +919,10 @@ function readDB(): Database {
   }
 }
 
-// Helper function to write to database securely
+// Helper function to write to database securely (and mark dirty for cloud upload)
 function writeDB(data: Database) {
+  cachedDBInMemory = data;
+  isDbDirty = true;
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch (error) {
