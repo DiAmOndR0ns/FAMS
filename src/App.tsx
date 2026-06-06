@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { Analytics } from '@vercel/analytics/react';
 import {
   Member,
   Meeting,
@@ -4113,6 +4114,7 @@ function ShieldSecurityHub({ currentUser, showTemporaryMsg }: ShieldSecurityHubP
           </table>
         </div>
       </div>
+      <Analytics />
 
     </div>
   );
