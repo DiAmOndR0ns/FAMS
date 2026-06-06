@@ -97,17 +97,25 @@ app.use(async (req, res, next) => {
     await ensureDbLoaded();
 
     const originalJson = res.json;
-    res.json = (function (this: any, body: any) {
+    res.json = (async function (this: any, body: any) {
       if (isDbDirty) {
-        persistDbToCloud().catch(err => console.error("[Aiven DB] Background save failed:", err));
+        try {
+          await persistDbToCloud();
+        } catch (err) {
+          console.error("[Aiven DB] Sync save failed:", err);
+        }
       }
       return originalJson.call(this, body);
     }) as any;
 
     const originalSend = res.send;
-    res.send = (function (this: any, body: any) {
+    res.send = (async function (this: any, body: any) {
       if (isDbDirty) {
-        persistDbToCloud().catch(err => console.error("[Aiven DB] Background save failed:", err));
+        try {
+          await persistDbToCloud();
+        } catch (err) {
+          console.error("[Aiven DB] Sync save failed:", err);
+        }
       }
       return originalSend.call(this, body);
     }) as any;
